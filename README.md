@@ -1,6 +1,4 @@
-# ff_prob
-
-#Fantasy Football with Probabilistic Modeling (Using TFP)
+# Fantasy Football with Probabilistic Modeling (Using Tensorflow Probability)
 
 ## Intro 
 
@@ -37,11 +35,11 @@ This is explicitly a top-down approach, I'm situating players within games, and 
 
 ### Modeling Approach  
 
-![](images/modeling_approach.png)  
+![](https://drive.google.com/file/d/1zaqKx_9yzFDL_y1t9Y_1mUr0jF38_5Jn/view?usp=sharing)  
 
 ### Prediction Approach  
 
-![](images/prediction_approach.png)  
+![](https://drive.google.com/file/d/1OHwmQFOqzAij2IElyLdBv-bVTBlLpDqJ/view?usp=sharing)  
 
 ## Steps (Code)
 
