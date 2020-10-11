@@ -8,6 +8,7 @@ library(tfprobability)
 library(keras)
 library(scales)
 library(labeling)
+library(glue)
 
 reticulate::use_condaenv('tf2gpu', required = TRUE)
 
@@ -39,13 +40,15 @@ game_feature <- game %>%
          pts_allowed_4wk_std_dev = slide_dbl(allow, sd, .before = 4, .after = -1, .complete = TRUE)) %>%
   ungroup() %>%
   arrange(game_id) %>%
-  ## after week 5, every team has at least 4 games played
-  filter(week>5) %>%
+  ## Filter to after week 4 and only 
+  filter(week>4) %>%
   ## widen by home_away to get single row per game_id
   pivot_wider(id_cols = game_id, names_from = home_away, values_from = ats_4wk:pts_allowed_4wk_std_dev) %>%
   ## join back to original game df
   inner_join(game, by='game_id') %>%
-  select(season, result, total, spread_line, total_line, div_game, roof, surface, week, weekday, home_rest, away_rest, ats_4wk_away:pts_allowed_4wk_std_dev_home) %>%
+  select(season, result, total, spread_line, total_line, div_game, week, weekday, home_rest, away_rest, ats_4wk_away:pts_allowed_4wk_std_dev_home) %>%
+  ## Removes games with only one team having played 4 games (teams with early byes, etc.)
+  na.omit() %>%
   ## treat week as a categorical var
    mutate(week = as.character(week))
 
@@ -60,15 +63,17 @@ game_feature_19_20 <- game_feature[game_feature$season>=2019, -1]
 split <- initial_split(game_feature_pre_18, prop = 3/5)
 
 labels = c("result", "total")
-feature_formula = reformulate(termlabels = names(game_feature)[3:length(game_feature)])
+feature_formula = reformulate(termlabels = names(game_feature_pre_18)[3:length(game_feature_pre_18)])
 
 ## Create Recipe
-recipe_obj <- recipe(feature_formula, data = game_feature) %>%
+recipe_obj <- recipe(feature_formula, data = training(split)) %>%
   step_center(all_numeric()) %>%
   step_scale(all_numeric()) %>%
   step_other(all_nominal(), threshold = .05) %>%
   step_dummy(all_nominal(), one_hot = TRUE) %>%
   prep(training = training(split), retain = FALSE)
+
+saveRDS(recipe_obj, 'game_recipe.rds')
 
 x_train <- bake(recipe_obj, new_data = training(split), composition = "matrix")
 x_valid <- bake(recipe_obj, new_data = testing(split), composition = "matrix")
@@ -97,7 +102,7 @@ main_layers <- input_layers %>%
   layer_dense(units = 16, activation='relu', regularizer_l1_l2()) 
 
 spread_output <- main_layers %>%
-  layer_dense(units = 16, activation='relu') %>%
+  layer_dense(units = 16, activation='relu', regularizer_l1_l2()) %>%
   layer_dense(units = 4, activation = 'linear') %>%
   layer_distribution_lambda(function(x) {
     tfd_sinh_arcsinh(loc = x[, 1, drop = FALSE],
@@ -109,7 +114,7 @@ spread_output <- main_layers %>%
   )
   
 points_output <- main_layers %>%
-  layer_dense(units = 16, activation='relu') %>%
+  layer_dense(units = 16, activation='relu', regularizer_l1_l2()) %>%
   layer_dense(units = 4, activation = 'linear') %>%
   layer_distribution_lambda(function(x) {
     tfd_sinh_arcsinh(loc = x[, 1, drop = FALSE],
@@ -136,12 +141,15 @@ history <- model %>% fit(x=list(x_train),
                          shuffle=TRUE,
                          #validation_split = .4,
                          validation_data = list(x_valid, list(spread_output = y_spread_valid, points_output = y_points_valid)),
-                         epochs = 200, 
-                         batch_size=32, 
+                         epochs = 20, 
+                         batch_size=16, 
                          callbacks=list(callback_early_stopping(monitor='val_loss', patience = 20))
 
 )
 
+save_model_weights_tf(model, "game_tfp_weights.tf")
+
+load_model_weights_tf(model, "game_tfp_weights.tf")
 
 pred_dist <- model(list(tf$constant(x_test)))
 
@@ -221,57 +229,7 @@ out_points <- tibble(
   over = as.numeric(actual_points>lv_over_under)
 ) 
 
-#View(out_points)
-
-## Spread Accuracy Plots
-out_spread %>%
-  select(up10:up90) %>% 
-  summarize_each(funs = mean) %>%
-  pivot_longer(up10:up90, names_to = 'over_quantile', values_to = 'pct') %>%
-  ggplot(aes(x=over_quantile, y=pct, label=scales::percent(pct, accuracy = .01))) +
-  geom_col() +
-  geom_text(vjust=1, color='white') +
-  theme_minimal() +
-  scale_y_continuous(labels=scales::percent) +
-  ggtitle('% Games going above spread quantiles')
-
-
-## Distribution vs Expected Uniform Distribution
-out_spread %>%
-  ggplot(aes(x=prob_actual_spread)) +
-  geom_density(fill = 'darkgreen') +
-  geom_density(data = enframe(as.numeric(tfd_sample(tfd_uniform(), 10000))), 
-               mapping = aes(x=value), 
-               color='black', linetype='dashed', fill='white', alpha=.3) +
-  theme_dark() +
-  ggtitle('CDF of Actual Spreads (Home-Away)',
-          subtitle = 'White Distribution is Theoretical Uniform Distribution (Expected in Long Run)')
-
-## Variation by Quantile Range
-out_spread %>%
-  mutate(range_80 = quant90-quant10,
-         range_50 = quant75-quant25) %>%
-  select(actual_spread, range_80, range_50) %>%
-  pivot_longer(range_80:range_50, names_to = 'range_type', values_to = 'range_val') %>%
-  ggplot(aes(x=range_val, y=actual_spread, color=range_type, fill=range_type)) +
-  geom_point(alpha=.1) +
-  geom_smooth() +
-  facet_wrap(~range_type, scales = 'free') +
-  #scale_y_log10() +
-  #coord_cartesian(xlim = c(0, .1)) +
-  theme_dark() +
-  ylab('Actual Spread (Log Scale') +
-  xlab('Quantile Range') +
-  ggtitle('Spread Variation by Quantile Range')
-
-
-# 50% Classification Threshold
-out_spread %>%
-  ggplot(aes(x=quant50, y=actual_spread)) +
-  geom_point(color='green') +
-  geom_smooth() +
-  theme_dark() +
-  ggtitle('50th Percentile vs Actual Spread')
+### Spread Plots ######
 
 # Confusion Matrix at 50% Cutoff
 out_spread %>%
@@ -282,16 +240,72 @@ out_spread %>%
   summarize(n=n(), .groups = 'keep') %>%
   ungroup(actual) %>%
   mutate(n_pred = sum(n),
-         pct_pred_correct = n/n_pred) %>%
-  ggplot(aes(x=predicted, y=actual, fill=pct_pred_correct, label=n)) +
+         pct_pred_correct = n/n_pred,
+         pct_pred_correct_format = percent(pct_pred_correct, accuracy = .01),
+         out_str = glue("N: {n} \n Ratio of Predictions: {pct_pred_correct_format}")) %>%
+  ggplot(aes(x=predicted, y=actual, fill=pct_pred_correct, label=out_str)) +
   geom_tile() +
   geom_text() +
   scale_fill_distiller(palette = "PRGn", direction = 1) +
   theme_dark()
 
+## Spread Accuracy Plots
+out_spread %>%
+  select(up10:up90) %>% 
+  summarize_each(funs = mean) %>%
+  pivot_longer(up10:up90, names_to = 'over_quantile', values_to = 'pct') %>%
+  ggplot(aes(x=over_quantile, y=pct, label=scales::percent(pct, accuracy = .01))) +
+  geom_col(fill="green") +
+  theme_dark() +
+  geom_text(vjust=1) +
+  scale_y_continuous(labels=scales::percent) +
+  ggtitle('% Games going above spread quantiles')
+
+
+## Distribution vs Expected Uniform Distribution
+out_spread %>%
+  ggplot(aes(x=prob_actual_spread)) +
+  geom_density(fill = 'green') +
+  geom_density(data = enframe(as.numeric(tfd_sample(tfd_uniform(), nrow(out_spread)))), 
+               mapping = aes(x=value), 
+               color='black', linetype='dashed', fill='white', alpha=.3) +
+  theme_dark() +
+  ggtitle('CDF of Actual Spreads (Home-Away)',
+          subtitle = 'White Distribution is Sampled Uniform Distribution (Expected in Long Run)')
+
+## Variation by Quantile Range
+out_spread %>%
+  mutate(range_80 = quant90-quant10,
+         range_50 = quant75-quant25) %>%
+  select(actual_spread, range_80, range_50) %>%
+  pivot_longer(range_80:range_50, names_to = 'range_type', values_to = 'range_val') %>%
+  ggplot(aes(x=range_val, y=actual_spread, color=range_type, fill=range_type)) +
+  geom_point(alpha=.2) +
+  geom_smooth() +
+  facet_wrap(~range_type, scales = 'free') +
+  #scale_y_log10() +
+  #coord_cartesian(xlim = c(0, .1)) +
+  theme_dark() +
+  ylab('Actual Spread (Log Scale)') +
+  xlab('Quantile Range') +
+  ggtitle('Spread Variation by Quantile Range')
+
+
+# 50% Classification Threshold
+out_spread %>%
+  ggplot(aes(x=quant50, y=actual_spread)) +
+  geom_point(color='green') +
+  geom_smooth(method = 'gam') +
+  theme_dark() +
+  ggtitle('50th Percentile vs Actual Spread') +
+  ylab('Actual Spread') +
+  xlab('50th Percentile Spread Prediction')
+
+
+
 # Cover Probabilities
 out_spread %>%
-  mutate(prob_lv_spread_cut = cut(prob_lv_spread, seq(from=0, to=1, by=.1))) %>%
+  mutate(prob_lv_spread_cut = cut(prob_lv_spread, c(0, .33, .66, 1))) %>%
   group_by(prob_lv_spread_cut) %>%
   summarize(pct_covered = mean(cover)) %>%
   ggplot(aes(x=prob_lv_spread_cut, y=pct_covered, label = percent(pct_covered, accuracy = .1))) +
@@ -300,14 +314,31 @@ out_spread %>%
   theme_dark() +
   scale_y_continuous(labels = percent) +
   ylab("Pct Home Teams Covering the Spread") +
-  xlab("Probability of Home Team Covering the Spread (10 Groups)") +
-  ggtitle('% Home Teams Covering by CDF Decile')
+  xlab("Probability of Home Team Covering the Spread (3 Groups)") +
+  ggtitle('% Home Teams Covering by Grouped CDF')
 
 
+## Points Accuracy Plots #######################
 
-## Over/Under Model
 
-## Points Accuracy Plots
+# Confusion Matrix at 50% Cutoff
+out_points %>%
+  mutate(predicted = factor(ifelse(prob_lv_over_under>.5, "Over", "Under"), levels = c("Under", "Over")),
+         actual = factor(ifelse(over==1, "Over", "Under"), levels = c("Under", "Over"))) %>%
+  select(predicted, actual) %>%
+  group_by(predicted, actual) %>%
+  summarize(n=n(), .groups = 'keep') %>%
+  ungroup(actual) %>%
+  mutate(n_pred = sum(n),
+         pct_pred_correct = n/n_pred,
+         pct_pred_correct_format = percent(pct_pred_correct, accuracy = .01),
+         out_str = glue("N: {n} \n Ratio of Predictions: {pct_pred_correct_format}")) %>%
+  ggplot(aes(x=predicted, y=actual, fill=pct_pred_correct, label=out_str)) +
+  geom_tile() +
+  geom_text() +
+  scale_fill_distiller(palette = "PRGn", direction = 1) +
+  theme_dark()
+
 
 # 
 out_points %>%
@@ -326,12 +357,12 @@ out_points %>%
 out_points %>%
   ggplot(aes(x=prob_actual_points)) +
   geom_density(fill = 'green') +
-  geom_density(data = enframe(as.numeric(tfd_sample(tfd_uniform(), 10000))), 
+  geom_density(data = enframe(as.numeric(tfd_sample(tfd_uniform(), nrow(out_points)))), 
                mapping = aes(x=value), 
                color='black', linetype='dashed', fill='white', alpha=.3) +
   theme_dark() +
   ggtitle('CDF of Actual Points (Home-Away)',
-          subtitle = 'White Distribution is Theoretical Uniform Distribution (Expected in Long Run)')
+          subtitle = 'White Distribution is Sampled Uniform Distribution')
 
 ## Variation by Quantile Range
 out_points %>%
@@ -339,14 +370,14 @@ out_points %>%
          range_50 = quant75-quant25) %>%
   select(actual_points, range_80, range_50) %>%
   pivot_longer(range_80:range_50, names_to = 'range_type', values_to = 'range_val') %>%
-  ggplot(aes(x=range_val, y=actual_points, color=range_type, fill=range_type)) +
-  geom_point(alpha=.1) +
-  geom_smooth() +
+  filter(range_type=='range_80') %>%
+  ggplot(aes(x=range_val, y=actual_points)) +
+  geom_point(color='green') +
+  geom_smooth(fill='green') +
   facet_wrap(~range_type, scales = 'free') +
   #scale_y_log10() +
-  #coord_cartesian(xlim = c(0, .1)) +
   theme_dark() +
-  ylab('Actual Points (Log Scale') +
+  ylab('Actual Points (Log Scale)') +
   xlab('Quantile Range') +
   ggtitle('Point Variation by Quantile Range')
 
@@ -355,13 +386,13 @@ out_points %>%
 out_points %>%
   ggplot(aes(x=quant50, y=actual_points)) +
   geom_point(color='green') +
-  geom_smooth() +
+  geom_smooth(method = 'gam') +
   theme_dark() +
-  ggtitle('50th Percentile vs Actual Points')
+  ggtitle('50th Percentile Projection vs Actual Points')
 
 # Cover Probabilities
 out_points %>%
-  mutate(prob_lv_points_cut = cut(prob_lv_over_under, c(0, .25, .5, .75, 1))) %>%
+  mutate(prob_lv_points_cut = cut(prob_lv_over_under,  c(-.01, .33, .66, 1))) %>%
   group_by(prob_lv_points_cut) %>%
   summarize(pct_over = mean(over),
             group = n()) %>%
@@ -373,22 +404,6 @@ out_points %>%
   ylab("Pct Home Teams Covering the Spread") +
   xlab("Probability of Home Team Covering the Spread (10 Groups)") +
   ggtitle('% Home Teams Covering by CDF Decile')
-
-# Confusion Matrix at 50% Cutoff
-out_points %>%
-  mutate(predicted = ifelse(prob_lv_over_under>.5, "Over", "Under"),
-         actual = ifelse(over==1, "Over", "Under")) %>%
-  select(predicted, actual) %>%
-  group_by(predicted, actual) %>%
-  summarize(n=n(), .groups = 'keep') %>%
-  ungroup(actual) %>%
-  mutate(n_pred = sum(n),
-         pct_pred_correct = n/n_pred) %>%
-  ggplot(aes(x=predicted, y=actual, fill=pct_pred_correct, label=n)) +
-  geom_tile() +
-  geom_text() +
-  scale_fill_distiller(palette = "PRGn", direction = 1) +
-  theme_dark()
 
 
 
